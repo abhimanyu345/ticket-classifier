@@ -3,7 +3,7 @@ stages:
     cmd: python src/preprocess.py
     deps:
       - src/preprocess.py
-      - data/raw/customer_support_tickets.csv
+      - data/raw/twcs.csv
     outs:
       - data/processed/train.csv
       - data/processed/val.csv
