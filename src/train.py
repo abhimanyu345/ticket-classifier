@@ -1,3 +1,4 @@
+%%writefile src/train.py
 import os
 import numpy as np
 import pandas as pd
@@ -11,15 +12,14 @@ from transformers import (
 )
 from sklearn.metrics import accuracy_score, f1_score, classification_report
 from sklearn.preprocessing import LabelEncoder
-import torch
 
 # ── Config ────────────────────────────────────────────────────────────────────
-MODEL_NAME   = "distilbert-base-uncased"
-MAX_LENGTH   = 128
-BATCH_SIZE   = 16
-EPOCHS       = 3
-LR           = 2e-5
-OUTPUT_DIR   = "models/distilbert-ticket-classifier"
+MODEL_NAME    = "distilbert-base-uncased"
+MAX_LENGTH    = 128
+BATCH_SIZE    = 32
+EPOCHS        = 4
+LR            = 3e-5
+OUTPUT_DIR    = "models/distilbert-ticket-classifier"
 PROCESSED_DIR = "data/processed"
 
 # ── Load data ─────────────────────────────────────────────────────────────────
@@ -39,9 +39,16 @@ def encode_labels(train, val, test):
 
 # ── Tokenize ──────────────────────────────────────────────────────────────────
 def tokenize(df, tokenizer):
-    dataset = Dataset.from_pandas(df[["text", "label_id"]].rename(columns={"label_id": "labels"}))
+    dataset = Dataset.from_pandas(
+        df[["text", "label_id"]].rename(columns={"label_id": "labels"})
+    )
     def _tokenize(batch):
-        return tokenizer(batch["text"], truncation=True, padding="max_length", max_length=MAX_LENGTH)
+        return tokenizer(
+            batch["text"],
+            truncation=True,
+            padding="max_length",
+            max_length=MAX_LENGTH
+        )
     return dataset.map(_tokenize, batched=True)
 
 # ── Metrics ───────────────────────────────────────────────────────────────────
@@ -55,7 +62,6 @@ def compute_metrics(eval_pred):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    # Init WandB — will prompt for API key if not set
     wandb.init(
         project="ticket-classifier",
         config={
@@ -64,6 +70,7 @@ def main():
             "batch_size": BATCH_SIZE,
             "lr":         LR,
             "max_length": MAX_LENGTH,
+            "dataset":    "twitter-customer-support",
         }
     )
 
@@ -76,9 +83,9 @@ def main():
 
     print("Tokenizing...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    train_ds = tokenize(train_df, tokenizer)
-    val_ds   = tokenize(val_df,   tokenizer)
-    test_ds  = tokenize(test_df,  tokenizer)
+    train_ds  = tokenize(train_df, tokenizer)
+    val_ds    = tokenize(val_df,   tokenizer)
+    test_ds   = tokenize(test_df,  tokenizer)
 
     print("Loading model...")
     model = AutoModelForSequenceClassification.from_pretrained(
@@ -94,15 +101,16 @@ def main():
         per_device_train_batch_size=BATCH_SIZE,
         per_device_eval_batch_size=BATCH_SIZE,
         learning_rate=LR,
-        evaluation_strategy="epoch",
+        eval_strategy="epoch",
         save_strategy="epoch",
         load_best_model_at_end=True,
         metric_for_best_model="f1_macro",
-        report_to="wandb",          # ← sends all metrics to WandB
+        report_to="wandb",
         run_name=wandb.run.name,
-        logging_steps=20,
-        warmup_ratio=0.1,
+        logging_steps=50,
         weight_decay=0.01,
+        warmup_steps=200,
+        fp16=True,              # faster training on T4 GPU
     )
 
     trainer = Trainer(
@@ -116,32 +124,41 @@ def main():
     print("Training...")
     trainer.train()
 
-    # ── Evaluate on test set ───────────────────────────────────────────────────
-    print("Evaluating on test set...")
+    # ── Test set evaluation ───────────────────────────────────────────────────
+    print("\nEvaluating on test set...")
     preds_output = trainer.predict(test_ds)
-    preds = np.argmax(preds_output.predictions, axis=-1)
-    report = classification_report(test_ds["labels"], preds, target_names=le.classes_)
+    preds  = np.argmax(preds_output.predictions, axis=-1)
+    labels = test_ds["labels"]
+
+    report = classification_report(labels, preds, target_names=le.classes_)
     print(report)
 
-    # Log final test metrics to WandB
     wandb.log({
-        "test_accuracy": accuracy_score(test_ds["labels"], preds),
-        "test_f1_macro": f1_score(test_ds["labels"], preds, average="macro"),
-        "classification_report": report,
+        "test_accuracy": accuracy_score(labels, preds),
+        "test_f1_macro": f1_score(labels, preds, average="macro"),
+        "classification_report": wandb.Table(
+            columns=["report"],
+            data=[[report]]
+        )
     })
 
-    # ── Save model + tokenizer ────────────────────────────────────────────────
+    # ── Save model ────────────────────────────────────────────────────────────
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     trainer.save_model(OUTPUT_DIR)
     tokenizer.save_pretrained(OUTPUT_DIR)
-    print(f"Model saved to {OUTPUT_DIR}")
+    print(f"\nModel saved to {OUTPUT_DIR}")
 
-    # Save model as WandB artifact (this is the Model Registry part)
+    # ── Log artifact to WandB ─────────────────────────────────────────────────
     artifact = wandb.Artifact(
         name="ticket-classifier-model",
         type="model",
-        description="DistilBERT fine-tuned on customer support tickets",
-        metadata={"f1_macro": f1_score(test_ds["labels"], preds, average="macro")}
+        description="DistilBERT fine-tuned on Twitter customer support",
+        metadata={
+            "f1_macro":  f1_score(labels, preds, average="macro"),
+            "accuracy":  accuracy_score(labels, preds),
+            "dataset":   "twitter-customer-support",
+            "classes":   list(le.classes_),
+        }
     )
     artifact.add_dir(OUTPUT_DIR)
     wandb.log_artifact(artifact)
